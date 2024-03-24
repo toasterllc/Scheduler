@@ -84,7 +84,7 @@ static void ISR_Button() {
 }
 
 int main() {
-    // Disable watchdog, unlock GPIOS
+    // Disable watchdog, unlock GPIOs
     WDTCTL = WDTPW | WDTHOLD;
     PM5CTL0 &= ~LOCKLPM5;
     
@@ -99,7 +99,7 @@ int main() {
     P2IE  = BIT3;
     P2IFG = 0;
     
-    // Configure SysTick for frequency `_SysTickFreqHz`
+    // Configure SysTick for frequency `SysTickFreqHz`
     TA1CCR0 = (32768/SysTickFreqHz)-1;
     TA1CTL = TASSEL__ACLK | MC__UP | TACLR | TAIE ;
     
