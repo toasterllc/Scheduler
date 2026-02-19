@@ -117,11 +117,11 @@ private:
 public:
     using TicksPeriod = T_TicksPeriod;
     
-    // StackInit(): initializes the stack pointer to task 0's stack, which is expected
+    // StackInit(): initialize the stack pointer to task 0's stack, which Scheduler.h expects before
+    // Run() is called.
     [[gnu::always_inline]]
     static inline void StackInit() {
 #if defined(__MSP430__)
-        // Load stack pointer
 //        constexpr uintptr_t sp_value = initial_sp();
         if constexpr (sizeof(void*) == 2) {
             // Small memory model
@@ -167,6 +167,7 @@ public:
     }
     
     // Run(): scheduler entry point; runs task 0
+    // StackInit() must be called before Run().
     [[noreturn]]
     static void Run() {
         // Init stack guards
@@ -175,11 +176,6 @@ public:
         _TaskRun();
         for (;;);
     }
-    
-//template<typename... Args>
-//decltype(auto) get_first(Args&&... args) {
-//    return std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...));
-//}
     
     // Current(): returns whether any of T_Tasks are the currently-running task
     template<typename... T_Task>
