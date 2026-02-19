@@ -6,6 +6,7 @@
 #include <array>
 #include <limits>
 #include <ratio>
+#include <tuple>
 
 // SchedulerStack: macro to apply appropriate attributes to stack declarations
 // gnu::used is apparently necessary for the gnu::section attribute to work when
@@ -91,8 +92,6 @@ void T_Sleep(),                     // T_Sleep: sleep function; invoked when no 
 size_t T_StackGuardCount,           // T_StackGuardCount: number of pointer-sized stack guard elements to use
 void T_StackOverflow(size_t),       // T_StackOverflow: function to call when stack overflow is detected;
                                     //   argument is the task index (in T_Tasks) with the corrupted stack.
-auto T_StackInterrupt,              // T_StackInterrupt: interrupt stack pointer (only used to monitor
-                                    //   interrupt stack for overflow; unused if T_StackGuardCount==0)
 
 typename... T_Tasks                 // T_Tasks: list of tasks
 >
@@ -118,6 +117,48 @@ private:
 public:
     using TicksPeriod = T_TicksPeriod;
     
+    [[gnu::always_inline]]
+    static inline void StackInit() {
+        constexpr const void* Task0StackTop = _StackTop<_Task0>();
+        
+#if defined(__MSP430__)
+        // Load stack pointer
+//        constexpr uintptr_t sp_value = initial_sp();
+        if constexpr (sizeof(void*) == 2) {
+            // Small memory model
+            asm volatile("mov #%0, sp" : : "i" (Task0StackTop) : );
+        } else {
+            // Large memory model
+            asm volatile("mov.a #%0, sp" : : "i" (Task0StackTop) : );
+        }
+        
+#elif defined(__arm__)
+        if constexpr (_StackInterrupt) {
+            // Set the MSP+PSP stack pointers
+            // Hardware typically initializes MSP to the SP value at the start of the vector table, but we
+            // still need to set MSP here (in addition to PSP) because in the STMApp case, we're executing
+            // because the bootloader invoked our ISR_Reset() directly (not via hardware). Therefore in
+            // that case, hardware didn't initialize MSP, so we need to initialize it manually here.
+            asm volatile("ldr r0, =%0" : : "i" (Task0StackTop) : ); // r0  = _StartupStackInterrupt
+            asm volatile("msr msp, r0" : : : );                     // msp = r0
+            asm volatile("ldr r0, =%0" : : "i" (Task0StackTop) : ); // r0  = Task0StackTop
+            asm volatile("msr psp, r0" : : : );                     // psp = r0
+            
+            // Make PSP the active stack
+            asm volatile("mrs r0, control" : : : );             // r0 = control
+            asm volatile("orrs r0, r0, #2" : : : );             // Set SPSEL bit (enable using PSP stack)
+            asm volatile("msr control, r0" : : : );             // control = r0
+            asm volatile("isb" : : : );                         // Instruction Synchronization Barrier
+        
+        } else {
+            #warning implement
+            static_assert(_StackInterrupt);
+        }
+#else
+        #error Task: Unsupported architecture
+#endif
+    }
+    
     // Run(): scheduler entry point
     // Invokes task 0's Run() function
     [[noreturn]]
@@ -127,10 +168,10 @@ public:
         for (;;);
     }
     
-    template<typename T_Task>
-    static constexpr void* _StackEnd() {
-        return (void*)((uint8_t*)T_Task::Stack + sizeof(T_Task::Stack));
-    }
+//template<typename... Args>
+//decltype(auto) get_first(Args&&... args) {
+//    return std::get<0>(std::forward_as_tuple(std::forward<Args>(args)...));
+//}
     
     // Current(): returns whether any of T_Tasks are the currently-running task
     template<typename... T_Task>
@@ -145,7 +186,7 @@ public:
     static void Start(_TaskFn run) {
         // Disable ints (because _TaskStart requires it)
         IntState ints(false);
-        _TaskStart(_TaskGet<T_Task>(), run, _StackEnd<T_Task>());
+        _TaskStart(_TaskGet<T_Task>(), run, _StackTop<T_Task>());
     }
     
     // Start(): start running T_Tasks with their respective Run() functions
@@ -155,7 +196,7 @@ public:
     static void Start() {
         // Disable ints (because _TaskStart requires it)
         IntState ints(false);
-        ((_TaskStart(_TaskGet<T_Task>(), T_Task::Run, _StackEnd<T_Task>()), ...));
+        ((_TaskStart(_TaskGet<T_Task>(), T_Task::Run, _StackTop<T_Task>()), ...));
     }
     
     // Stop(): stop T_Tasks
@@ -483,7 +524,7 @@ private:
         }
         
         // Initialize the interrupt stack guard
-        if constexpr (_InterruptStackGuardEnabled) _StackGuardInit(_InterruptStackGuard);
+        if constexpr (_StackInterruptGuardEnabled) _StackGuardInit(_StackInterruptGuard);
     }
     
     static void _StackGuardInit(_StackGuard& guard) {
@@ -508,7 +549,7 @@ private:
         constexpr size_t SaveRegCount = _SchedulerStackSaveRegCount+1;
         constexpr size_t ExtraRegCount = SaveRegCount % _SchedulerStackAlign;
         constexpr size_t TotalRegCount = SaveRegCount + ExtraRegCount;
-        void**const stackEnd = (void**)sp;
+        void**const stackTop = (void**)sp;
         // Set task run function
         task.run = run;
         // Make task runnable
@@ -516,9 +557,9 @@ private:
         // Reset wake deadline
         task.wakeDeadline = std::nullopt;
         // Reset stack pointer
-        task.sp = stackEnd - TotalRegCount;
+        task.sp = stackTop - TotalRegCount;
         // Push initial return address == _TaskRun
-        *(stackEnd-ExtraRegCount-1) = (void*)_TaskRun;
+        *(stackTop-ExtraRegCount-1) = (void*)_TaskRun;
     }
     
     // _TaskStop(): reset a task to be stopped
@@ -566,7 +607,7 @@ private:
     static void _TaskSwap(_RunnableFn fn, std::optional<Deadline> wake=std::nullopt) {
         // Check stack guards
         if constexpr (_StackGuardEnabled) _StackGuardCheck(*_TaskCurr->stackGuard);
-        if constexpr (_InterruptStackGuardEnabled) _StackGuardCheck(_InterruptStackGuard);
+        if constexpr (_StackInterruptGuardEnabled) _StackGuardCheck(_StackInterruptGuard);
         
         // Update _TaskCurr's state
         _TaskCurr->runnable = fn;
@@ -591,15 +632,42 @@ private:
         return false;
     }
     
-    // _TaskGet(): returns the _Task& for the given T_Task
+    // _Task0RunFnOrNullptr(): returns T_Task's Run() function if it's task 0; otherwise returns nullptr
     template<typename T_Task>
-    static constexpr _TaskFn _Task0RunFn() {
+    static constexpr _TaskFn _Task0RunFnOrNullptr() {
         static_assert((std::is_same_v<T_Task, T_Tasks> || ...), "invalid task");
         constexpr size_t idx = _ElmIdx<T_Task, T_Tasks...>();
         if constexpr (idx == 0) {
             return T_Task::Run;
         }
         return nullptr;
+    }
+    
+    template<typename T_Task, typename=void>
+    struct _StackInterruptExists : std::false_type {};
+    
+    template<typename T_Task>
+    struct _StackInterruptExists<T_Task, std::void_t<decltype(T_Task::StackInterrupt)>> : std::true_type {};
+    
+    template<typename T_Task>
+    static constexpr void* _StackInterruptTop() {
+        if constexpr (_StackInterruptExists<T_Task>::value) {
+            return (uint8_t*)T_Task::StackInterrupt + sizeof(T_Task::StackInterrupt);
+        }
+        return nullptr;
+    }
+    
+    template<typename T_Task>
+    static constexpr void* _StackInterruptBottom() {
+        if constexpr (_StackInterruptExists<T_Task>::value) {
+            return T_Task::StackInterrupt;
+        }
+        return nullptr;
+    }
+    
+    template<typename T_Task>
+    static constexpr void* _StackTop() {
+        return (uint8_t*)T_Task::Stack + sizeof(T_Task::Stack);
     }
     
     // _TaskGet(): returns the _Task& for the given T_Task
@@ -617,7 +685,7 @@ private:
     
     static inline _Task _Tasks[sizeof...(T_Tasks)] = {
         _Task{
-            .run        = _Task0RunFn<T_Tasks>(),
+            .run        = _Task0RunFnOrNullptr<T_Tasks>(),
             .runnable   = _RunnableFalse,
             .sp         = nullptr,
             .stackGuard = (_StackGuard*)T_Tasks::Stack,
@@ -625,15 +693,15 @@ private:
         }...,
     };
     
+    using _Task0 = std::tuple_element_t<0, std::tuple<T_Tasks...>>;
     static constexpr bool _StackGuardEnabled = (bool)T_StackGuardCount;
-    static constexpr bool _InterruptStackGuardEnabled =
-        _StackGuardEnabled &&
-        !std::is_null_pointer_v<decltype(T_StackInterrupt)>;
+    static constexpr void* _StackInterrupt = _StackInterruptTop<_Task0>();
+    static constexpr bool _StackInterruptGuardEnabled = _StackGuardEnabled && _StackInterrupt;
     
-    // _InterruptStackGuard: ideally this would be `static constexpr` instead of
+    // _StackInterruptGuard: ideally this would be `static constexpr` instead of
     // `static inline`, but C++ doesn't allow constexpr reinterpret_cast.
     // In C++20 we could use std::bit_cast for this.
-    static inline _StackGuard& _InterruptStackGuard = *(_StackGuard*)T_StackInterrupt;
+    static inline _StackGuard& _StackInterruptGuard = *(_StackGuard*)_StackInterruptBottom<_Task0>();
     static inline _Task* _TaskPrev = nullptr;
     static inline _Task* _TaskCurr = &_Tasks[0];
     
