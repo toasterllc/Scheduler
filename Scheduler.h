@@ -83,6 +83,10 @@ template<
 typename T_TicksPeriod,             // T_TicksPeriod: a std::ratio specifying the period between Tick()
                                     //   calls, in seconds
 
+void T_SystemInit(),                // T_Init: system init function, that should copy flash content into
+                                    //   RAM, call __libc_init_array(), etc.
+                                    //   Called by Scheduler::Run() once the stack is initialized.
+
 void T_Sleep(),                     // T_Sleep: sleep function; invoked when no tasks have work to do.
                                     //   T_Sleep() is called with interrupts disabled, and interrupts must
                                     //   be disabled upon return. Implementations may temporarily enable
@@ -118,7 +122,7 @@ public:
     using TicksPeriod = T_TicksPeriod;
     
     [[gnu::always_inline]]
-    static inline void StackInit() {
+    static inline void _StackInit() {
         constexpr const void* Task0StackTop = _StackTop<_Task0>();
         
 #if defined(__MSP430__)
@@ -160,10 +164,16 @@ public:
     }
     
     // Run(): scheduler entry point
-    // Invokes task 0's Run() function
-    [[noreturn]]
+    // Initializes the system stack, calls T_SystemInit(), and runs task 0
+    [[noreturn, gnu::naked]]
     static void Run() {
+        // Stack must be initialized before we invoke a regular function (T_SystemInit())
+        _StackInit();
+        // Init system (copy globals from flash -> RAM, clear BSS region, call static constructors)
+        T_SystemInit();
+        // Init stack guards; this must happen after T_SystemInit() to ensure our globals are initialized
         _StackGuardInit();
+        // Run task 0
         _TaskRun();
         for (;;);
     }
@@ -633,15 +643,15 @@ private:
     }
     
     // _Task0RunFnOrNullptr(): returns T_Task's Run() function if it's task 0; otherwise returns nullptr
-    template<typename T_Task>
-    static constexpr _TaskFn _Task0RunFnOrNullptr() {
-        static_assert((std::is_same_v<T_Task, T_Tasks> || ...), "invalid task");
-        constexpr size_t idx = _ElmIdx<T_Task, T_Tasks...>();
-        if constexpr (idx == 0) {
-            return T_Task::Run;
-        }
-        return nullptr;
-    }
+//    template<typename T_Task>
+//    static constexpr _TaskFn _Task0RunFnOrNullptr() {
+//        static_assert((std::is_same_v<T_Task, T_Tasks> || ...), "invalid task");
+//        constexpr size_t idx = _ElmIdx<T_Task, T_Tasks...>();
+//        if constexpr (idx == 0) {
+//            return T_Task::Run;
+//        }
+//        return nullptr;
+//    }
     
     template<typename T_Task, typename=void>
     struct _StackInterruptExists : std::false_type {};
@@ -685,7 +695,8 @@ private:
     
     static inline _Task _Tasks[sizeof...(T_Tasks)] = {
         _Task{
-            .run        = _Task0RunFnOrNullptr<T_Tasks>(),
+            .run        = (std::is_same_v<T_Tasks, _Task0> ? T_Tasks::Run : nullptr),
+//            .run        = _Task0RunFnOrNullptr<T_Tasks>(),
             .runnable   = _RunnableFalse,
             .sp         = nullptr,
             .stackGuard = (_StackGuard*)T_Tasks::Stack,
