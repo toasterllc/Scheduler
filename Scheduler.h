@@ -83,10 +83,6 @@ template<
 typename T_TicksPeriod,             // T_TicksPeriod: a std::ratio specifying the period between Tick()
                                     //   calls, in seconds
 
-void T_SystemInit(),                // T_Init: system init function, that should copy flash content into
-                                    //   RAM, call __libc_init_array(), etc.
-                                    //   Called by Scheduler::Run() once the stack is initialized.
-
 void T_Sleep(),                     // T_Sleep: sleep function; invoked when no tasks have work to do.
                                     //   T_Sleep() is called with interrupts disabled, and interrupts must
                                     //   be disabled upon return. Implementations may temporarily enable
@@ -121,57 +117,59 @@ private:
 public:
     using TicksPeriod = T_TicksPeriod;
     
+    // StackInit(): initializes the stack pointer to task 0's stack, which is expected
     [[gnu::always_inline]]
-    static inline void _StackInit() {
-        constexpr const void* Task0StackTop = _StackTop<_Task0>();
-        
+    static inline void StackInit() {
 #if defined(__MSP430__)
         // Load stack pointer
 //        constexpr uintptr_t sp_value = initial_sp();
         if constexpr (sizeof(void*) == 2) {
             // Small memory model
-            asm volatile("mov #%0, sp" : : "i" (Task0StackTop) : );
+            asm volatile("mov #%0, sp" : : "i" (_StackTask0) : );
         } else {
             // Large memory model
-            asm volatile("mov.a #%0, sp" : : "i" (Task0StackTop) : );
+            asm volatile("mov.a #%0, sp" : : "i" (_StackTask0) : );
         }
         
 #elif defined(__arm__)
-        if constexpr (_StackInterrupt) {
-            // Set the MSP+PSP stack pointers
-            // Hardware typically initializes MSP to the SP value at the start of the vector table, but we
-            // still need to set MSP here (in addition to PSP) because in the STMApp case, we're executing
-            // because the bootloader invoked our ISR_Reset() directly (not via hardware). Therefore in
-            // that case, hardware didn't initialize MSP, so we need to initialize it manually here.
-            asm volatile("ldr r0, =%0" : : "i" (Task0StackTop) : ); // r0  = _StartupStackInterrupt
-            asm volatile("msr msp, r0" : : : );                     // msp = r0
-            asm volatile("ldr r0, =%0" : : "i" (Task0StackTop) : ); // r0  = Task0StackTop
-            asm volatile("msr psp, r0" : : : );                     // psp = r0
+        // Set the stack pointers: MSP+PSP (if task 0 has StackInterrupt member), or just MSP (otherwise)
+        //
+        // ARM cores conventionally initialize MSP to the SP value at the start of the vector table.
+        // Instead, Scheduler.h expects to set SP manually via this function (and therefore the vector
+        // table's SP value can contain anything). This technique works as long as StackInit() is called
+        // early after chip reset, before the stack is needed.
+        //
+        // With this technique, we gain cleanliness (stacks exist as simple members inside of the task
+        // struct, including the interrupt stack, instead of needing to declare stacks with asm directives
+        // and reference them in the vector table), at the cost of needing to manually call this function
+        // and a few extra instructions.
+        
+        if constexpr (_StackInterrupt != nullptr) {
+            // We have an interrupt stack: set the MSP+PSP stack pointers
+            asm volatile("ldr r0, =%0" : : "i" (_StackInterrupt) : );   // r0  = _StackInterrupt
+            asm volatile("msr msp, r0" : : : );                         // msp = r0
+            asm volatile("ldr r0, =%0" : : "i" (_StackTask0) : );       // r0  = _StackTask0
+            asm volatile("msr psp, r0" : : : );                         // psp = r0
             
             // Make PSP the active stack
-            asm volatile("mrs r0, control" : : : );             // r0 = control
-            asm volatile("orrs r0, r0, #2" : : : );             // Set SPSEL bit (enable using PSP stack)
-            asm volatile("msr control, r0" : : : );             // control = r0
-            asm volatile("isb" : : : );                         // Instruction Synchronization Barrier
+            asm volatile("mrs r0, control" : : : );                     // r0 = control
+            asm volatile("orrs r0, r0, #2" : : : );                     // Set SPSEL bit (enable using PSP stack)
+            asm volatile("msr control, r0" : : : );                     // control = r0
+            asm volatile("isb" : : : );                                 // Instruction Synchronization Barrier
         
         } else {
-            #warning implement
-            static_assert(_StackInterrupt);
+            // We don't have an interrupt stack: simply set the current stack pointer
+            asm volatile("ldr sp, =%0" : : "i" (_StackTask0) : );       // sp  = _StackTask0
         }
 #else
         #error Task: Unsupported architecture
 #endif
     }
     
-    // Run(): scheduler entry point
-    // Initializes the system stack, calls T_SystemInit(), and runs task 0
-    [[noreturn, gnu::naked]]
+    // Run(): scheduler entry point; runs task 0
+    [[noreturn]]
     static void Run() {
-        // Stack must be initialized before we invoke a regular function (T_SystemInit())
-        _StackInit();
-        // Init system (copy globals from flash -> RAM, clear BSS region, call static constructors)
-        T_SystemInit();
-        // Init stack guards; this must happen after T_SystemInit() to ensure our globals are initialized
+        // Init stack guards
         _StackGuardInit();
         // Run task 0
         _TaskRun();
@@ -693,6 +691,12 @@ private:
         return std::is_same_v<T_1,T_2> ? 0 : 1 + _ElmIdx<T_1, T_s...>();
     }
     
+    using _Task0 = std::tuple_element_t<0, std::tuple<T_Tasks...>>;
+    static constexpr bool _StackGuardEnabled = (bool)T_StackGuardCount;
+    static constexpr void* _StackTask0 = _StackTop<_Task0>();
+    static constexpr void* _StackInterrupt = _StackInterruptTop<_Task0>();
+    static constexpr bool _StackInterruptGuardEnabled = _StackGuardEnabled && _StackInterrupt;
+    
     static inline _Task _Tasks[sizeof...(T_Tasks)] = {
         _Task{
             .run        = (std::is_same_v<T_Tasks, _Task0> ? T_Tasks::Run : nullptr),
@@ -703,11 +707,6 @@ private:
             .next       = &_TaskGet<T_Tasks, 1>(),
         }...,
     };
-    
-    using _Task0 = std::tuple_element_t<0, std::tuple<T_Tasks...>>;
-    static constexpr bool _StackGuardEnabled = (bool)T_StackGuardCount;
-    static constexpr void* _StackInterrupt = _StackInterruptTop<_Task0>();
-    static constexpr bool _StackInterruptGuardEnabled = _StackGuardEnabled && _StackInterrupt;
     
     // _StackInterruptGuard: ideally this would be `static constexpr` instead of
     // `static inline`, but C++ doesn't allow constexpr reinterpret_cast.
