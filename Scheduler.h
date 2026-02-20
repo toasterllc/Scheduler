@@ -122,13 +122,15 @@ public:
     [[gnu::always_inline]]
     static inline void StackInit() {
 #if defined(__MSP430__)
-//        constexpr uintptr_t sp_value = initial_sp();
+        // MSP430 doesn't support a separate interrupt stack
+        static_assert(_StackInterrupt == nullptr);
+        
         if constexpr (sizeof(void*) == 2) {
             // Small memory model
-            asm volatile("mov #%0, sp" : : "i" (_StackTask0) : );
+            asm volatile("mov %0, sp" : : "i" (_StackTask0) : );
         } else {
             // Large memory model
-            asm volatile("mov.a #%0, sp" : : "i" (_StackTask0) : );
+            asm volatile("mov.a %0, sp" : : "i" (_StackTask0) : );
         }
         
 #elif defined(__arm__)
@@ -637,15 +639,11 @@ private:
     }
     
     // _Task0RunFnOrNullptr(): returns T_Task's Run() function if it's task 0; otherwise returns nullptr
-//    template<typename T_Task>
-//    static constexpr _TaskFn _Task0RunFnOrNullptr() {
-//        static_assert((std::is_same_v<T_Task, T_Tasks> || ...), "invalid task");
-//        constexpr size_t idx = _ElmIdx<T_Task, T_Tasks...>();
-//        if constexpr (idx == 0) {
-//            return T_Task::Run;
-//        }
-//        return nullptr;
-//    }
+    template<typename T_Task>
+    static constexpr _TaskFn _Task0RunFnOrNullptr() {
+        if constexpr (std::is_same_v<T_Task, _Task0>) return T_Task::Run;
+        return nullptr;
+    }
     
     template<typename T_Task, typename=void>
     struct _StackInterruptExists : std::false_type {};
@@ -695,8 +693,7 @@ private:
     
     static inline _Task _Tasks[sizeof...(T_Tasks)] = {
         _Task{
-            .run        = (std::is_same_v<T_Tasks, _Task0> ? T_Tasks::Run : nullptr),
-//            .run        = _Task0RunFnOrNullptr<T_Tasks>(),
+            .run        = _Task0RunFnOrNullptr<T_Tasks>(),
             .runnable   = _RunnableFalse,
             .sp         = nullptr,
             .stackGuard = (_StackGuard*)T_Tasks::Stack,
