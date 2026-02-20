@@ -316,14 +316,14 @@ public:
         
         // Test whether `deadline` has already passed.
         //
-        // Because _ISR.CurrentTime rolls over periodically, it's impossible to differentiate
+        // Because _ISR.time rolls over periodically, it's impossible to differentiate
         // between `deadline` passing versus merely being far in the future. (For example,
         // consider the case where time is tracked with a uint8_t: if Deadline=127 and
         // CurrentTime=128, either Deadline passed one tick ago, or Deadline will pass
         // 255 ticks in the future.)
         //
         // To solve this ambiguity, we require deadlines to be within
-        // [-TicksMax/2-1, +TicksMax/2] of _ISR.CurrentTime (where TicksMax is the maximum
+        // [-TicksMax/2-1, +TicksMax/2] of _ISR.time (where TicksMax is the maximum
         // value that the `Ticks` type can hold), which allows us to employ the following
         // heuristic:
         //
@@ -332,9 +332,9 @@ public:
         // For a deadline to be considered in the future, it must be in the range:
         //   [CurrentTime+1, CurrentTime+TicksMax/2+1]
         //
-        // Now that ints are disabled (and therefore _ISR.CurrentTime is unchanging), we
+        // Now that ints are disabled (and therefore _ISR.time is unchanging), we
         // can employ the above heuristic to determine whether `deadline` has already passed.
-        const bool past = deadline-_ISR.CurrentTime-1 > _TicksMax/2;
+        const bool past = deadline-_ISR.time-1 > _TicksMax/2;
         if (past) return false;
         if (fn()) return true;
         _TaskSwap(fn, deadline);
@@ -362,7 +362,7 @@ public:
     static void Delay(Ticks ticks) {
         IntState ints(false);
         _TaskCurr->wakeDeadline = _DeadlineForTicks(ticks);
-        _ISR.WakeDeadlineUpdate = true;
+        _ISR.wake.update = true;
         
         do {
             T_Sleep();
@@ -378,17 +378,17 @@ public:
     // Tick() is intended to be called from an ISR that fires with period
     // `T_TicksPeriod`.
     static bool Tick() {
-        _ISR.CurrentTime++;
+        _ISR.time++;
         
         // Wake tasks matching the current tick.
         bool wake = false;
-        if (_ISR.WakeDeadlineUpdate || (_ISR.WakeDeadline && *_ISR.WakeDeadline==_ISR.CurrentTime)) {
+        if (_ISR.wake.update || (_ISR.wake.pending && _ISR.wake.deadline==_ISR.time)) {
             // Wake the necessary tasks, and update _ISR.WakeDeadline
             Ticks wakeDelay = _TicksMax;
             std::optional<Deadline> wakeDeadline;
             for (_Task& task : _Tasks) {
                 if (!task.wakeDeadline) continue;
-                if (*task.wakeDeadline == _ISR.CurrentTime) {
+                if (*task.wakeDeadline == _ISR.time) {
                     // The task's deadline has been hit; wake it
                     task.runnable = _RunnableTrue;
                     task.wakeDeadline = std::nullopt;
@@ -396,7 +396,7 @@ public:
                 
                 } else {
                     // The task's deadline has not been hit; consider it as a candidate for the next _ISR.WakeDeadline
-                    const Ticks d = *task.wakeDeadline-_ISR.CurrentTime;
+                    const Ticks d = *task.wakeDeadline-_ISR.time;
                     if (d <= wakeDelay) {
                         wakeDelay = d;
                         wakeDeadline = task.wakeDeadline;
@@ -404,8 +404,9 @@ public:
                 }
             }
             
-            _ISR.WakeDeadline = wakeDeadline;
-            _ISR.WakeDeadlineUpdate = false;
+            _ISR.wake.deadline = wakeDeadline.value_or(0);
+            _ISR.wake.pending = (bool)wakeDeadline;
+            _ISR.wake.update = false;
         }
         
         return wake;
@@ -419,7 +420,7 @@ public:
     // Interrupt context: allowed
     static bool TickRequired() {
         IntState ints(false);
-        return _ISR.WakeDeadline || _ISR.WakeDeadlineUpdate;
+        return _ISR.wake.pending || _ISR.wake.update;
     }
     
     // CurrentTime(): returns the current time in ticks
@@ -431,7 +432,7 @@ public:
     // Interrupt context: allowed
     static Ticks CurrentTime() {
         IntState ints(false);
-        return _ISR.CurrentTime;
+        return _ISR.time;
     }
     
 private:
@@ -459,7 +460,7 @@ private:
     //
     // Ints: disabled (because we're accessing the same fields as Tick())
     static Deadline _DeadlineForTicks(Ticks ticks) {
-        return _ISR.CurrentTime+ticks+1;
+        return _ISR.time+ticks+1;
     }
     
     template<typename T>
@@ -618,7 +619,7 @@ private:
         // Update _TaskCurr's state
         _TaskCurr->runnable = fn;
         _TaskCurr->wakeDeadline = wake;
-        if (wake) _ISR.WakeDeadlineUpdate = true;
+        if (wake) _ISR.wake.update = true;
         
         // Get the next runnable task, or sleep if no task wants to run
         while (!_TaskNext()) {
@@ -708,11 +709,13 @@ private:
     static inline _Task* _TaskPrev = nullptr;
     static inline _Task* _TaskCurr = &_Tasks[0];
     
-    #warning TODO: these should be volatile no?
-    static inline struct {
-        Ticks CurrentTime = 0;
-        std::optional<Deadline> WakeDeadline;
-        bool WakeDeadlineUpdate = false;
+    static inline volatile struct {
+        Ticks time = 0;
+        struct {
+            Deadline deadline = 0;
+            bool pending = false;
+            bool update = false;
+        } wake;
     } _ISR;
 };
 
